@@ -1,43 +1,68 @@
-#!/usr/bin/env python
-
-PKG_NAME = "anubad - अनुवाद"
+#!/usr/bin/env python3
 
 import os, sys
 
-filepath = os.path.abspath(__file__)
-fullpath = os.path.dirname(filepath) + '/'
+__filepath__ = os.path.abspath(__file__)
+PWD = os.path.dirname(__filepath__) + '/'
 
-exec(open(fullpath + "gsettings.conf", encoding="UTF-8").read())
-exec(open(fullpath + "mysettings.conf", encoding="UTF-8").read())
+exec(open(PWD + "gsettings.conf", encoding="UTF-8").read())
+exec(open(PWD + "mysettings.conf", encoding="UTF-8").read())
 
-PATH_GLOSS = fullpath + PATH_GLOSS
-
-fp_dev_null = open(os.devnull, 'w')
-fp3 = fp_dev_null
-
+import gi
+gi.require_version('Gtk', '3.0')
 from gi.repository import Gtk, Gdk, Pango
-if os.name is not 'nt' and FLAG_IBus:
-    from gi.repository import IBus
 
+import importlib
 from collections import OrderedDict
 from subprocess import Popen
 from itertools import count
 
-from sidebar import treeview_signal_safe_toggler
+import core
 import preferences as Pre
 import sidebar as Side
-import browser as BL
+import browser
 import viewer as Vi
+import relations
 import add as Ad
 import utils
 
-if PATH_MYLIB and os.path.isdir(PATH_MYLIB):
-    sys.path.append(PATH_MYLIB)
+fp_dev_null = open(os.devnull, 'w')
+
+DEBUG = 0
+if "DEBUG" in os.environ:
+    try:
+        DEBUG = int(os.environ["DEBUG"])
+    except:
+        DEBUG = 1
+
+if 'DEBUGLY' in globals() and os.path.isdir(DEBUGLY) and DEBUG:
+    sys.path.append(DEBUGLY)
     from debugly import *
-    from pprint import pprint
 else:
-    sys.stdout = fp_dev_null
-    debug = lambda f, *arg, **karg: f(arg, karg)
+    debug = lambda func: func
+
+for i in range(3, 7):
+    if DEBUG > 0:
+        print("DEBUG: %d fp%d enabled"%(DEBUG, i), file=sys.stderr)
+        stream = "sys.stderr"
+        DEBUG -= 1
+    else:
+        stream = "fp_dev_null"
+    exec("fp%d = %s"%(i, stream))
+
+
+def treeview_signal_safe_toggler(func):
+    '''Gtk.TreeView() :changed: signal should be disable before new
+    selection is added, if connect it will trigger the change.
+
+    '''
+    def wrapper(self, *args, **kwargs):
+        treeselection = self.sidebar.treeview.get_selection()
+        treeselection.disconnect(self.sidebar.select_signal)
+        func_return = func(self, *args, **kwargs)
+        self.sidebar.select_signal = treeselection.connect("changed", self.sidebar_on_row_changed)
+        return func_return
+    return wrapper
 
 #   ____ _   _ ___
 #  / ___| | | |_ _|
@@ -46,35 +71,39 @@ else:
 #  \____|\___/|___|
 #
 class GUI(Gtk.Window):
-    clip_CYCLE = None
-    notebook_OBJS = []
+    clipboard = Gtk.Clipboard.get(Gdk.SELECTION_CLIPBOARD)
 
     def __init__(self, parent=None):
-        Gtk.Window.__init__(self, title=PKG_NAME)
-        self.set_default_size(600, 500)
+        Gtk.Window.__init__(self)
         self.parent = parent
         self.track_FONT = set()
 
+        self.clips = []
+        self.clips_CYCLE = None
+
         self.view_CURRENT = set()
-        self.view_LAST = None
-        self.search_SPACE = None
+        self.mark_CURRENT = (None, None)
 
         self.hist_LIST = []
         self.hist_CURSOR = 0
         self.copy_BUFFER = ""
 
-        self.ignore_keys = [ v for k, v in utils.key_codes.items() if v != utils.key_codes["RETURN"]]
+        self.engines = {
+            'r:': lambda query: self._view_results({ query: core.Glossary.search(query[2:]) }),
+            # w: lambda: self._view_results({ query: core.Glossary.search(query[2:]) }),
+            # s:
+        }
 
+        # accelerators
         self.makeWidgets()
-        self.connect('key_press_event', self.key_binds)
+        self.connect('key_release_event', self.key_binds)
         self.connect('delete-event', Gtk.main_quit)
-        self.connect('focus-in-event', lambda *e: self._on_focus_in_event())
+        self.connect('focus-in-event', lambda *e: self.search_entry.grab_focus())
         self.connect('focus-out-event', lambda *e: self._on_focus_out_event())
 
         self.search_entry.grab_focus()
+        self.set_default_size(600, 550)
         self.show_all()
-        # NOTE: GTK BUG, notebook page switch only after its visible
-        self.notebook.set_current_page(self.notebook.MAIN_TAB)
 
 
     def turn_off_auto_copy(func):
@@ -84,19 +113,9 @@ class GUI(Gtk.Window):
         return wrapper
 
 
-    def _on_focus_in_event(self):
-        # NOTE this is TEMP fixes for me
-        print("focus: in")
-        self.search_entry.grab_focus()
-        if os.name is 'nt': return
-        if ibus.is_global_engine_enabled():
-            ibus.exit(True)
-            print("sorry: killing ibus there is no way to disable")
-
-
     def _on_focus_out_event(self):
         if self.toolbar.t_Copy.get_active():
-            clipboard.set_text(self.copy_BUFFER, -1)
+            __class__.clipboard.set_text(self.copy_BUFFER, -1)
 
 
     def makeWidgets(self):
@@ -105,16 +124,15 @@ class GUI(Gtk.Window):
 
         self.toolbar = self.makeWidgets_toolbar()
         self.layout.attach(self.toolbar, left=0, top=0, width=5, height=1)
-        self.layout.attach(self.makeWidgets_searchbar(), 0, 1, 5, 1)
+        self.layout.attach(self.makeWidgets_searchbar(), left=0, top=1, width=5, height=1)
 
         hpaned = Gtk.Paned()
-        self.layout.attach(hpaned, 0, 2, 5, 2)
+        self.layout.attach(hpaned, left=0, top=2, width=5, height=2)
         hpaned.add1(self.makeWidgets_sidebar())
         hpaned.add2(self.makeWidgets_viewer())
         hpaned.set_position(165)
 
-        self.notebook = self.makeWidgets_browser(LIST_GLOSS[0])
-        self.layout.attach(self.notebook, 0, 5, 5, 2)
+        # self.layout.attach(self.makeWidgets_relations(), left=0, top=5, width=5, height=2)
 
 
     def makeWidgets_toolbar(self):
@@ -152,7 +170,7 @@ class GUI(Gtk.Window):
         ## Add Button
         bar.b_Add = Gtk.ToolButton(icon_name=Gtk.STOCK_ADD)
         bar.add(bar.b_Add)
-        bar.b_Add.connect("clicked", lambda w: self.add_to_gloss())
+        # bar.b_Add.connect("clicked", lambda w: self.add_to_gloss())
         bar.b_Add.set_tooltip_markup("Add new word to Glossary, <u>Ctrl+i</u>")
         ##
         #
@@ -164,9 +182,10 @@ class GUI(Gtk.Window):
         bar.t_Copy.set_active(True)
         ##
         ## Search Show Toggle Button
-        bar.t_ShowAll = Gtk.ToggleToolButton(icon_name=Gtk.STOCK_DIALOG_INFO)
-        bar.t_ShowAll.set_active(False)
-        bar.add(bar.t_ShowAll)
+        bar.t_WordNet = Gtk.ToggleToolButton(icon_name=Gtk.STOCK_DIALOG_INFO)
+        bar.t_WordNet.set_active(False)
+        bar.t_WordNet.set_tooltip_markup("Dictionary Mode (WordNet)")
+        bar.add(bar.t_WordNet)
         ##
         #
         bar.add(Gtk.SeparatorToolItem())
@@ -180,7 +199,6 @@ class GUI(Gtk.Window):
         ##
         ## About
         bar.b_About = Gtk.ToolButton(icon_name=Gtk.STOCK_ABOUT)
-        bar.b_About.connect("clicked", self._about_dialog)
         bar.add(bar.b_About)
         bar.b_About.set_tooltip_markup("More About Anubad")
         return bar
@@ -197,17 +215,10 @@ class GUI(Gtk.Window):
         if diff == -1: self.toolbar.b_Forward.set_sensitive(True)
 
         self.hist_CURSOR = pos
-
-        self.items_FOUND.clear()
-        self.views_CURRENT.clear()
-        query, self.items_FOUND, views = self.hist_LIST[pos]
-        self._view_items(views)
-        self.search_entry.set_text(query)
+        self._view_results(self.hist_LIST[pos])
 
 
     def _show_history(self, widget):
-        # print(widget.get_state_flags())
-        # TODO: fix state with widget attrib
         state = self.hist_menu_toggle_state
         self.hist_menu_toggle_state = not state
         if state: return
@@ -216,7 +227,7 @@ class GUI(Gtk.Window):
         self.history_menu = Gtk.Menu()
         widget.set_menu(self.history_menu)
 
-        for i, (query_RESULTS, all_FUZZ) in enumerate(reversed(self.hist_LIST), 1):
+        for i, query_RESULTS in enumerate(reversed(self.hist_LIST), 1):
             query = ', '.join([ k for k in query_RESULTS.keys() ])
             rmi = Gtk.RadioMenuItem(label=query)
             rmi.show()
@@ -225,20 +236,6 @@ class GUI(Gtk.Window):
             self.history_menu.append(rmi)
 
         self.history_menu.show_all()
-
-
-    def _about_dialog(self, widget):
-        aboutdialog = Gtk.AboutDialog(parent=self)
-        # aboutdialog.set_default_size(200, 800) # BUG: Not WORKING
-        aboutdialog.set_logo_icon_name(Gtk.STOCK_ABOUT)
-        aboutdialog.set_program_name(PKG_NAME)
-        aboutdialog.set_comments("\nTranslation Glossary\n")
-        aboutdialog.set_website("http://github.com/foss-np/anubad/")
-        aboutdialog.set_website_label("Some Label")
-        aboutdialog.set_authors(open(fullpath + '../AUTHORS').read().splitlines())
-        aboutdialog.set_license(open(fullpath + '../LICENSE').read())
-        aboutdialog.run()
-        aboutdialog.destroy()
 
 
     def makeWidgets_searchbar(self):
@@ -259,12 +256,11 @@ class GUI(Gtk.Window):
         self.search_entry.modify_font(FONT_obj)
         self.track_FONT.add(self.search_entry)
 
-        # accelerators
-        accel_search = Gtk.AccelGroup()
-        self.add_accel_group(accel_search)
-        self.search_entry.add_accelerator("grab_focus", accel_search, ord('f'), Gdk.ModifierType.CONTROL_MASK, 0)
+        accel = Gtk.AccelGroup()
+        self.add_accel_group(accel)
+        self.search_entry.add_accelerator("grab_focus", accel, ord('f'), Gdk.ModifierType.CONTROL_MASK, 0)
 
-        ## Button
+        ## Search Button
         self.b_search = Gtk.Button(label="Search")
         layout.pack_start(self.b_search, expand=False, fill=False, padding=1)
         self.b_search.connect('clicked', lambda w: self.search_entry_binds(w, None))
@@ -280,7 +276,7 @@ class GUI(Gtk.Window):
             if event.keyval == ord('c'): self.search_entry.set_text("")
         elif Gdk.ModifierType.SHIFT_MASK & event.state:
             if event.keyval == 65293: # <enter> return
-                print("shift enter")
+                print("action: shift enter", file=fp3)
                 state = self.toolbar.t_ShowAll.get_active()
                 self.toolbar.t_ShowAll.set_active(not state)
                 self.search_and_reflect()
@@ -290,222 +286,208 @@ class GUI(Gtk.Window):
 
     def makeWidgets_sidebar(self):
         self.sidebar = Side.Sidebar(self)
-        Side.GUI = GUI
+        treeselection = self.sidebar.treeview.get_selection()
+        self.sidebar.select_signal = treeselection.connect("changed", self.sidebar_on_row_changed)
+
         for obj in self.sidebar.track_FONT:
             obj.modify_font(FONT_obj)
         return self.sidebar
 
 
+    @debug
+    def sidebar_on_row_changed(self, treeselection):
+        model, pathlist = treeselection.get_selected_rows()
+        self.clips.clear()
+        for path in pathlist:
+            self._view_item(*self.sidebar.get_suggestion(path))
+
+        if len(self.clips) == 0: return
+        self.clips_CYCLE = utils.circle(self.clips)
+        self._circular_search(+1)
+
+
     def makeWidgets_viewer(self):
-        global clipboard
-        Vi.clipboard = clipboard
         self.viewer = Vi.Viewer(self)
         self.viewer.textview.modify_font(FONT_obj)
         self.track_FONT.add(self.viewer.textview)
 
-        old_clean = self.viewer.clean
-        # FIX-ME: make it real smart
-        def smart_clean():
-            old_clean()
-            # TODO last clean job after view is fixed
-            # if len(self.items_VIEWED) > 1:
-            #     self.view_last
-            self.view_CURRENT.clear()
-            # NOTE: vvv is for sugession
-            selection = self.sidebar.treeview.get_selection()
-            selection.unselect_all()
-            # model, treeiter = selection.get_selected()
-            # if treeiter is None:
-            #     print("It clean")
-        self.viewer.clean = smart_clean
-
+        self.viewer.tb_clean.connect("clicked", self.viewer_clean)
+        self.viewer.textview.connect("button-release-event", self.viewer_after_click)
+        self.viewer.textview.connect("event", self.viewer_on_activity)
         return self.viewer
 
 
-    def makeWidgets_browser(self, gloss):
-        GLOSS = PATH_GLOSS + gloss
-        print("loading:", gloss, file=sys.stderr)
-        notebook = Gtk.Notebook()
-        notebook.GLOSS = GLOSS
-        tab = 0
-        for file_name in os.listdir(GLOSS):
-            if not file_name[-4:] in FILE_TYPES: continue
-            if "main.tra" in file_name: notebook.MAIN_TAB = tab
-            obj = BL.BrowseList(self.parent, GLOSS + file_name)
-            obj.treeview.connect("row-activated", self.browser_row_double_click)
-            obj.treeview.modify_font(FONT_obj)
-            self.track_FONT.add(obj.treeview)
-            notebook.append_page(obj, Gtk.Label(label=file_name[:-4]))
-            tab += 1
-        GUI.notebook_OBJS.append(notebook)
-        return notebook
+    def viewer_clean(self, widget=None):
+        self.copy_BUFFER = ""
+        self.view_CURRENT.clear()
+        self.viewer.textbuffer.set_text("")
+        selection = self.sidebar.treeview.get_selection()
+        selection.unselect_all()
 
 
-    def browser_row_double_click(self, widget, treepath, treeviewcol):
-        selection = widget.get_selection()
-        model, treeiter = selection.get_selected()
-
-        if treeiter is None: return
-        tab = self.notebook.get_current_page()
-        obj = self.notebook.get_nth_page(tab)
-        row = list(model[treeiter])
-        self.viewer.parse(row, obj.SRC)
-        self.viewer.jump_to_end()
-        return
-
-
-    def create_search_SPACE(self):
-        search_SPACE = []
-        for i, obj in enumerate(self.notebook_OBJS):
-            for c in count():
-                widget = obj.get_nth_page(c)
-                if widget is None: break
-                search_SPACE.append((i, c, widget))
-        return search_SPACE
+    def viewer_after_click(self, textview, eventbutton):
+        mark = self.viewer.textbuffer.get_insert()
+        end = self.viewer.textbuffer.get_iter_at_mark(mark)
+        char = end.get_char()
+        # print(end.get_offset())
+        if not end.forward_word_end(): return
+        begin = end.copy()
+        if not begin.backward_word_start(): return
+        word = self.viewer.textbuffer.get_text(begin, end, True)
+        ## validate selectection
+        if char not in word: return
+        BEGIN = self.viewer.textbuffer.get_start_iter()
+        END = self.viewer.textbuffer.get_end_iter()
+        self.viewer.textbuffer.remove_tag(self.viewer.tag_found, BEGIN, END)
+        self.viewer.textbuffer.apply_tag(self.viewer.tag_found, begin, end)
+        self.toolbar.t_Copy.set_active(True)
+        self.copy_BUFFER = word
 
 
-    def search_and_reflect(self):
-        raw_query = self.search_entry.get_text()
-        if not raw_query: return
-        if 'r:' == raw_query[:2]: query = raw_query[2:]
-        else: query = raw_query.strip().lower()
+    def viewer_on_activity(self, textview, event):
+        if event.type == Gdk.EventType._2BUTTON_PRESS:
+            bounds = self.viewer.textbuffer.get_selection_bounds()
+            if not bounds: return
+            begin, end = bounds
+            query = self.viewer.textbuffer.get_text(begin, end, True)
+            self.search_entry.set_text(query)
+            self.search_and_reflect(query)
+
+
+    def makeWidgets_relations(self):
+        self.relatives = relations.Relatives()
+        return self.relatives
+
+
+    def get_active_query(self):
+        selection = self.sidebar.treeview.get_selection()
+        model, pathlst, = selection.get_selected_rows()
+
+        if pathlst:
+            *c, query = model[pathlst[0]]
+        else:
+            query = self.search_entry.get_text().strip().lower()
+
+        return query
+
+
+    def search_and_reflect(self, query=None):
+        if query is None:
+            query = self.search_entry.get_text()
+            if not query: return
+
+            for key, func in self.engines.items():
+                if key == query[:2]: # raw mode
+                    func(query)
+                    return
 
         ## Ordered Dict use for undo/redo history
         query_RESULTS = OrderedDict()
-        all_FUZZ = set()
-        for word in set(query.split()):
-            n, FULL, FUZZ = self.searchWord(word)
-            query_RESULTS[word] = (FULL, n is not 0)
-            all_FUZZ = all_FUZZ | FUZZ
 
-        self._view_items(query_RESULTS, all_FUZZ)
+        for w in set(query.split()):
+            word = w.strip().lower()
+            query_RESULTS[word] = core.Glossary.search(word)
 
-        self.hist_LIST.append((query_RESULTS, all_FUZZ))
+        self._view_results(query_RESULTS)
+
+        self.hist_LIST.append(query_RESULTS)
         self.hist_CURSOR = len(self.hist_LIST) - 1
         self.toolbar.bm_Backward.set_sensitive(True)
         self.toolbar.b_Forward.set_sensitive(False)
 
 
-    def searchWord(self, word, search_SPACE=None):
-        FULL, FUZZ = [], set()
-        c = 0
-        if search_SPACE is None:
-            self.search_SPACE = self.create_search_SPACE()
-            search_SPACE = self.search_SPACE
+    def _view_item(self, instance, category, row):
+        ID, word, info = row
+        meta = (instance, category, ID)
+        parsed_info = core.Glossary.format_parser(info)
+        print(parsed_info, file=fp4)
+        ## put trasliteration copy at last
+        transliterate = []
+        for pos, val in parsed_info:
+            if   pos[0] == "_" or val == "": continue
+            elif pos == "_transliterate": transliterate.append(val); continue
+            self.clips.append(val)
 
-        for note, tab, obj in search_SPACE:
-            for item in obj.treebuffer:
-                if word not in item[1]: continue
-                c += 1
-                row = (note, tab, item, obj)
-                if word == item[1]: FULL.append(row)
-                else: FUZZ.add(row)
-        return c, FULL, FUZZ
+        self.clips += transliterate
+
+        if meta in self.view_CURRENT: return
+        self.viewer.append_result(word, parsed_info, category)
+        self.view_CURRENT.add(meta)
 
 
     @treeview_signal_safe_toggler
-    def _view_items(self, query_RESULTS, all_FUZZ=set()):
-        self.sidebar.treemodel.clear()
+    def _view_results(self, query_RESULTS):
+        self.sidebar.clear()
+        self.clips.clear()
         treeselection = self.sidebar.treeview.get_selection()
 
-        # pprint(query_RESULTS)
-        clip_out = []
-        c = 0
-        for word, (results, found) in query_RESULTS.items():
-            if not found:
+        end = self.viewer.textbuffer.get_end_iter()
+        begin = end.get_offset()
+
+        all_FUZZ = []
+        for word, (FULL, FUZZ) in query_RESULTS.items():
+            all_FUZZ += FUZZ
+            if not FULL:
                 self.viewer.not_found(word)
-                dict_grep2(word, self.viewer, False)
                 continue
-            for item in results:
-                note, tab, row, obj = item
-                ID, w, raw = row
-                c += 1
-                self.sidebar.treemodel.append([c, note, tab, ID, w, obj.SRC])
 
-                meta = (note, tab, ID)
-                view = meta not in self.view_CURRENT
-                clip_out += self.viewer.parse(row, obj.SRC, print_=view)
-                self.view_CURRENT.add(meta)
-                treeselection.select_path(c - 1)
+            for item in FULL:
+                self.sidebar.add_suggestion(*item)
+                self._view_item(*item)
+                treeselection.select_path(self.sidebar.count - 1)
 
-        for item in all_FUZZ:
-            note, tab, row, obj = item
-            ID, w, raw = row
-            c += 1
-            self.sidebar.treemodel.append([c, note, tab, ID, w, obj.SRC])
-            if not self.toolbar.t_ShowAll.get_active(): continue
 
-            meta = (note, tab, ID)
-            view = meta not in self.view_CURRENT
-            clip_out += self.viewer.parse(row, browser_obj.SRC, print_=view)
-            self.view_CURRENT.append(meta)
-            treeselection.select_path(c-1)
+        end = self.viewer.textbuffer.get_end_iter()
+        self.mark_CURRENT = (begin, end.get_offset())
+        self.viewer.jump_to_end()
 
-        if len(clip_out) == 0: return
-        GUI.clip_CYCLE = utils.circle(clip_out)
+        for item in sorted(all_FUZZ, key=lambda k: k[2][1]):
+            self.sidebar.add_suggestion(*item)
+
+        print("clip:", self.clips, file=fp3)
+        if len(self.clips) == 0: return
+        self.clips_CYCLE = utils.circle(self.clips)
         self._circular_search(+1)
         self.search_entry.grab_focus()
 
 
     @turn_off_auto_copy
-    def _open_dir(self):
-        print("pid:", Popen(["nemo", self.notebook.GLOSS]).pid)
-
-
-    @turn_off_auto_copy
-    def _open_term(self):
-        print("pid:", Popen([TERMINAL, "--working-directory=%s"%self.notebook.GLOSS]).pid)
-
-
-    @turn_off_auto_copy
     def _open_src(self):
-        if len(self.sidebar.treemodel) == 0:
-            t = self.notebook.get_current_page()
-            self.notebook.get_nth_page(t).open_src()
-            return
-
         treeselection = self.sidebar.treeview.get_selection()
-        model, pathlist = treeselection.get_selected_rows()
-        c, note, tab, ID, w, src = self.sidebar.treemodel[pathlist[0]]
+        model, pathlst = treeselection.get_selected_rows()
 
-        note_obj = GUI.notebook_OBJS[note]
-        note_obj.get_nth_page(tab).open_src(ID)
-        # TODO: connection
-        # process.connect('delete-event', lambda e: print("i'm back"))
-
-
-    def reload(self, gloss):
-        GLOSS = PATH_GLOSS + gloss
-        if self.notebook.GLOSS == GLOSS: return
-
-        self.layout.remove(self.notebook)
-        for obj in GUI.notebook_OBJS:
-            if obj.GLOSS == GLOSS:
-                self.notebook = obj
-                break
+        line = -1
+        if len(pathlst) == 0:
+            path = core.Glossary.instances[0].categories['main'][-1]
         else:
-            self.notebook = self.makeWidgets_browser(gloss)
+            instance, path, row = self.sidebar.get_suggestion(pathlst[0])
+            line = row[0]
 
-        self.layout.attach(self.notebook, 0, 5, 5, 2)
-        self.show_all()
-        self.notebook.set_current_page(self.notebook.MAIN_TAB)
+        if EDITOR == "": return
+
+        if EDITOR == "leafpad": command = EDITOR + " --jump=%d "%line
+        elif EDITOR == "gedit": command = EDITOR + " +%d "%line
+        else: command = EDITOR + " "
+
+        command += path
+
+        print("pid:", command, Popen(command.split()).pid, file=fp5)
 
 
-    def _reload_gloss(self):
-        current_tab = self.notebook.get_current_page()
-        obj = self.notebook.get_nth_page(current_tab)
-        obj.reload()
+    @turn_off_auto_copy
+    def _open_dir(self):
+        path = core.Glossary.instances[0].fullpath
+        print("pid:", Popen(["nemo", path]).pid, file=fp5)
 
 
     def _circular_search(self, d):
-        if not GUI.clip_CYCLE:
+        if not self.clips_CYCLE:
             self.search_entry.grab_focus()
             return
 
         self.toolbar.t_Copy.set_active(True)
-        global clipboard
         utils.diff = d
-        text = next(GUI.clip_CYCLE)
+        text = next(self.clips_CYCLE)
 
         begin = self.viewer.textbuffer.get_start_iter()
         end = self.viewer.textbuffer.get_end_iter()
@@ -518,18 +500,8 @@ class GUI(Gtk.Window):
         self.copy_BUFFER = text
 
 
-    def _circular_tab_switch(self, d):
-        c = self.notebook.get_current_page()
-        t = self.notebook.get_n_pages()
-        n = c + d
-        if n >= t: n = 0
-        elif n < 0: n = t - 1
-        self.notebook.set_current_page(n)
-
     @turn_off_auto_copy
     def add_to_gloss(self, query=""):
-        global clipboard
-        Ad.clipboard = clipboard
         add = Ad.Add(self, l1=query, l2="")
         for obj in add.track_FONT:
             obj.modify_font(FONT_obj)
@@ -538,7 +510,7 @@ class GUI(Gtk.Window):
 
 
     def _add_to_gloss_reflect(self, *args):
-        print("hello i'm back")
+        print("hello i'm back", file=fp5)
 
 
     def preference(self, query=""):
@@ -547,51 +519,33 @@ class GUI(Gtk.Window):
 
 
     def key_binds(self, widget, event):
-        # print(e.keyval)
         keyval, state = event.keyval, event.state
-        query = self.search_entry.get_text().strip().lower()
-        if   keyval == 65307: Gtk.main_quit() # Esc
-        elif keyval == 65481: self.reload(LIST_GLOSS[0]) # F12
-        elif keyval == 65480: self.reload(LIST_GLOSS[1]) # F11
-        elif keyval == 65479: self.reload(LIST_GLOSS[2]) # F10
-        elif keyval == 65476: xcowsay(query) # F7
-        elif keyval == 65474: self._reload_gloss() # F5
-        elif keyval == 65362: self.sidebar.treeview.grab_focus() # UP-Arrow
-        elif keyval == 65364: self.sidebar.treeview.grab_focus() # DOWN-Arrow
+        if   keyval == 65362: self.sidebar.treeview.grab_focus() # Up-arrow
+        elif keyval == 65364: self.sidebar.treeview.grab_focus() # Down-arrow
         elif Gdk.ModifierType.CONTROL_MASK & state:
-            if   keyval == ord('1'): print(dict_grep2(query, self.viewer, False))
-            elif keyval == ord('2'): dict_grep(query, self.viewer, False)
-            elif keyval == ord('3'): web_search(query, self.viewer)
-            elif keyval == ord('4'): dict_grep(query, self.viewer)
-            elif keyval == ord('e'): self._open_src()
-            elif keyval == ord('i'): self.add_to_gloss(query)
-            elif keyval == ord('l'): self.viewer.clean()
-            elif keyval == ord('o'): self._open_dir()
+            if   keyval == ord('e'): self._open_src()
+            # elif keyval == ord('i'): self.add_to_gloss()
+            elif keyval == ord('l'): self.viewer_clean()
             elif keyval == ord('r'): self._circular_search(-1)
             elif keyval == ord('s'): self._circular_search(+1)
-            elif keyval == ord('t'): self._open_term()
-            elif keyval == 65365: self._circular_tab_switch(-1) # pg-down
-            elif keyval == 65366: self._circular_tab_switch(+1) # pg-up
             elif keyval == ord('g'): # grab clipboard
-                clip = clipboard.wait_for_text()
+                clip = __class__.clipboard.wait_for_text()
                 if clip is None: return
                 query = clip.strip().lower()
                 self.search_entry.set_text(clip)
                 self.search_and_reflect()
             return
         elif Gdk.ModifierType.MOD1_MASK & state:
-            if ord('1') <= keyval <= ord('9'): self.notebook.set_current_page(keyval - ord('1')) # NOTE: range check not needed
-            elif keyval == ord('0'): self.notebook.set_current_page(self.notebook.MAIN_TAB)
-            elif keyval == 65361: self._jump_history(-1) # LEFT_ARROW
-            elif keyval == 65363: self._jump_history(+1) # RIGHT_ARROW
+            if   keyval == 65361: self._jump_history(-1) # Left-arrow
+            elif keyval == 65363: self._jump_history(+1) # Right-arrow
             return
         elif Gdk.ModifierType.SHIFT_MASK & event.state:
             # TODO Scroll viewer
-            if   keyval == 65365: pass # pg-down
-            elif keyval == 65366: pass # pg-up
+            if   keyval == 65365: pass # Pg-Dn
+            elif keyval == 65366: pass # Pg-Up
             return
 
-        if event.keyval in self.ignore_keys: return
+        if event.keyval in ignore_keys: return
         if self.search_entry.is_focus(): return
 
         self.search_entry.grab_focus()
@@ -600,49 +554,41 @@ class GUI(Gtk.Window):
         self.search_entry_binds(widget, event)
 
 
-def load_settings():
+def init():
+    # import __main__
+    # TODO where to add __main__function
+    core.fp3 = fp5
+    core.fp4 = fp6
+    Vi.PWD = PWD
+
+    global PATH_GLOSS
+    core.PATH_GLOSS = PATH_GLOSS = PWD + PATH_GLOSS
+
     global FONT_obj
-    FONT_obj =  Pango.font_description_from_string(def_FONT)
-    BL.fp3 = fp3
+    FONT_obj = Pango.font_description_from_string(def_FONT)
+    browser.FONT_obj = FONT_obj
+    browser.fp3 = fp4
 
+    # MAYBE do __main__ import here
 
-def root_binds(widget, event):
-    # print(event.keyval)
-    if event.keyval == 65307:
-        Gtk.main_quit()
+    global BROWSER
+    Vi.BROWSER = BROWSER
+
+    global ignore_keys
+    ignore_keys = [ v for k, v in utils.key_codes.items() if v != utils.key_codes["RETURN"]]
+
+    for path in LIST_GLOSS:
+        core.Glossary(path)
 
 
 def main():
-    load_settings()
-
-    global clipboard
-    clipboard = Gtk.Clipboard.get(Gdk.SELECTION_CLIPBOARD)
-
-    if os.name is not 'nt' and FLAG_IBus:
-        global ibus
-        ibus = IBus.Bus()
-        print("ibus.isconnected:", ibus.is_connected())
-        # print("ibus.global.settings:", ibus.get_use_global_engine())
-        # ibus_engine = ibus.get_global_engine()
-        # print("ibus.engine.languge:", ibus_engine.get_language())
-        # print("ibus.isactive:", ibus.is_global_engine_enabled())
-        # print()
-
-    global root
+    init()
     root = GUI()
-
+    notebook = browser.Notebook(core.Glossary.instances[0], root)
+    root.layout.attach(notebook, 0, 7, 5, 2)
     return root
 
 
 if __name__ == '__main__':
-    main().connect('key_press_event', root_binds)
-    # TODO: load plugins as modules
-    if PATH_PLUGINS and os.path.isdir(PATH_PLUGINS):
-        PATH_PLUGINS = fullpath + PATH_PLUGINS
-        sys.path.append(PATH_PLUGINS)
-        for file_name in os.listdir(PATH_PLUGINS):
-            if file_name[-3:] not in ".py": continue
-            print("plugin:", file_name, file=sys.stderr)
-            # import file_name[:-3]
-            exec(open(PATH_PLUGINS + file_name, encoding="UTF-8").read())
+    main()
     Gtk.main()

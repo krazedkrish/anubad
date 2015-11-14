@@ -11,7 +11,10 @@ tk-py2: mysettings.conf
 	python2 demo.pyw
 
 gtk3: mysettings.conf
-	./main.py
+	./app.py
+
+debug:
+	DEBUG=3 ./app.py
 
 wine: mysettings.conf
 	# note should load from same directory
@@ -24,6 +27,9 @@ dist:
 
 mysettings.conf:
 	touch mysettings.conf
+
+core:
+	./core.py
 
 browser:
 	./browser.py
@@ -39,3 +45,9 @@ add:
 
 preference:
 	./preferences.py
+
+relations:
+	./relations.py
+
+wordnet:
+	./wordnet.py ${WORD}
